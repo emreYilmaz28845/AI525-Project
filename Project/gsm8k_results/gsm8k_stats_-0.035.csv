@@ -1,0 +1,10 @@
+metric,value
+total,200
+baseline_correct,182
+agentic_correct,175
+corrected_by_verifier,3
+degraded_by_verifier,10
+unchanged_wrong,15
+baseline_accuracy,0.910
+agentic_accuracy,0.875
+accuracy_improvement,-0.035

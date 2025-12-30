@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -21,6 +22,8 @@ from typing import Iterable, Optional
 
 from datasets import load_dataset
 from langchain_core.messages import AIMessage, HumanMessage
+
+from collections import Counter
 
 from self_verification_agent_local_llama import (
     MAX_ATTEMPTS,
@@ -34,9 +37,13 @@ from self_verification_agent_local_llama import (
     enforce_verifier_structure,
     answers_are_equivalent,
     is_valid_critique,
+    extract_verifier_answer,
     parse_decision,
     strip_confidence,
 )
+
+# Number of samples for majority voting
+MAJORITY_VOTES = int(os.getenv("MAJORITY_VOTES", "3"))
 
 
 ANSWER_PATTERN = re.compile(r"####\s*([-+]?\d+(?:\.\d+)?)")
@@ -203,7 +210,7 @@ def run_agentic(
         if decision == "REVISE":
             if answers_are_equivalent(last_answer, critique_text, tolerance=ANSWER_TOLERANCE):
                 decision = "ACCEPT"
-            elif not is_valid_critique(critique_text, last_answer):
+            elif not is_valid_critique(critique_text):
                 decision = "ACCEPT"
         decisions.append(decision)
         history.append(critique)
@@ -217,34 +224,106 @@ def run_agentic(
     return last_answer, first_answer, answers, decisions, len(decisions), elapsed
 
 
+def run_majority_voting(
+    solver, question: str, num_votes: int = 3
+) -> tuple[str, list[str], list[str], float]:
+    """
+    Run the solver multiple times with temperature > 0 and take majority vote.
+    Returns: (final_answer, all_answers, extracted_numbers, elapsed_time)
+    """
+    from langchain_ollama import ChatOllama
+    from self_verification_agent_local_llama import SOLVER_MODEL, REQUEST_TIMEOUT
+
+    # Use temperature > 0 for diversity in answers
+    common_kwargs = {"request_timeout": REQUEST_TIMEOUT} if REQUEST_TIMEOUT else {}
+    diverse_solver = ChatOllama(model=SOLVER_MODEL, temperature=0.7, **common_kwargs)
+
+    start = time.time()
+    prompt = format_question(question)
+
+    answers = []
+    extracted_numbers = []
+
+    for i in range(num_votes):
+        response = diverse_solver.invoke([SOLVER_SYSTEM, HumanMessage(content=prompt)])
+        answer_text = response.content or ""
+        answers.append(answer_text)
+
+        # Extract the final number
+        extracted = extract_final_number(answer_text)
+        if extracted:
+            extracted_numbers.append(normalize_number(extracted) or extracted)
+
+    # Find majority answer
+    if extracted_numbers:
+        counter = Counter(extracted_numbers)
+        majority_answer, count = counter.most_common(1)[0]
+        # Find the full answer text that corresponds to majority
+        for i, num in enumerate(extracted_numbers):
+            if num == majority_answer:
+                final_answer = answers[i]
+                break
+        else:
+            final_answer = answers[0]
+    else:
+        final_answer = answers[0] if answers else ""
+        majority_answer = None
+
+    elapsed = time.time() - start
+    return final_answer, answers, extracted_numbers, elapsed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=50, help="Number of questions.")
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("AI525_Project/gsm8k_results.jsonl"),
+        default=Path("gsm8k_results/gsm8k_results.jsonl"),
         help="Output JSONL path.",
     )
     parser.add_argument(
         "--summary-csv",
         type=Path,
-        default=Path("AI525_Project/gsm8k_summary.csv"),
+        default=Path("gsm8k_results/gsm8k_summary.csv"),
         help="Output summary CSV path.",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["verification", "majority", "both"],
+        default="both",
+        help="Mode: 'verification' (self-verify), 'majority' (majority voting), 'both' (compare all)",
+    )
+    parser.add_argument(
+        "--votes",
+        type=int,
+        default=3,
+        help="Number of votes for majority voting (default: 3)",
     )
     args = parser.parse_args()
 
     records = load_gsm8k(args.limit)
     solver, verifier = build_llms()
 
+    # Warmup: Load both models into memory before timing starts
+    print("[Warmup] Loading solver model...")
+    solver.invoke([HumanMessage(content="What is 2+2?")])
+    if args.mode in ("verification", "both"):
+        print("[Warmup] Loading verifier model...")
+        verifier.invoke([HumanMessage(content="What is 2+2?")])
+    print(f"[Warmup] Models loaded. Starting benchmark (mode={args.mode}).\n")
+
     rows: list[EvalRow] = []
     baseline_correct_total = 0
     agentic_correct_total = 0
+    majority_correct_total = 0
     correction_total = 0
     false_positive_total = 0
     false_negative_total = 0
     baseline_time_total = 0.0
     agentic_time_total = 0.0
+    majority_time_total = 0.0
 
     for idx, record in enumerate(records, start=1):
         question = record.get("question", "")
@@ -253,91 +332,132 @@ def main() -> None:
 
         print(f"\n[{idx}/{len(records)}] {question[:80]}...")
 
+        # Always run baseline
         baseline_answer, baseline_time = run_baseline(solver, question)
-        (
-            agentic_answer,
-            first_answer,
-            attempt_answers,
-            decisions,
-            attempts,
-            agentic_time,
-        ) = run_agentic(solver, verifier, question)
-
         baseline_extracted = extract_final_number(baseline_answer)
-        agentic_extracted = extract_final_number(agentic_answer)
         baseline_norm = normalize_number(baseline_extracted)
-        agentic_norm = normalize_number(agentic_extracted)
-        first_extracted = extract_final_number(first_answer)
-        first_norm = normalize_number(first_extracted)
-
         baseline_correct = expected_norm is not None and baseline_norm == expected_norm
-        agentic_correct = expected_norm is not None and agentic_norm == expected_norm
-        first_correct = expected_norm is not None and first_norm == expected_norm
-
-        attempt_extracted = [
-            extract_final_number(answer) for answer in attempt_answers
-        ]
-        attempt_correct = [
-            normalize_number(value) == expected_norm if expected_norm is not None else False
-            for value in attempt_extracted
-        ]
-        correction_step = None
-        if expected_norm is not None:
-            for idx_attempt, is_correct in enumerate(attempt_correct, start=1):
-                if is_correct:
-                    correction_step = idx_attempt
-                    break
 
         print(
             "[Baseline] extracted="
             f"{baseline_extracted} correct={baseline_correct} time={baseline_time:.2f}s"
         )
-        print(
-            "[Agentic] first_extracted="
-            f"{first_extracted} correct={first_correct} attempts={attempts} "
-            f"time={agentic_time:.2f}s"
-        )
-        print(
-            "[Agentic] final_extracted="
-            f"{agentic_extracted} correct={agentic_correct} decisions={decisions}"
-        )
-
         baseline_correct_total += int(baseline_correct)
-        agentic_correct_total += int(agentic_correct)
-        correction_total += int((not baseline_correct) and agentic_correct)
-
-        if decisions:
-            final_decision = decisions[-1]
-            false_positive_total += int(
-                final_decision == "ACCEPT" and not agentic_correct
-            )
-            false_negative_total += int(
-                expected_norm is not None
-                and first_norm == expected_norm
-                and decisions[0] == "REVISE"
-            )
-
         baseline_time_total += baseline_time
-        agentic_time_total += agentic_time
+
+        # Self-verification mode
+        agentic_answer = ""
+        agentic_extracted = None
+        agentic_correct = False
+        first_answer = ""
+        first_correct = False
+        attempt_answers = []
+        decisions = []
+        attempts = 0
+        agentic_time = 0.0
+
+        if args.mode in ("verification", "both"):
+            (
+                agentic_answer,
+                first_answer,
+                attempt_answers,
+                decisions,
+                attempts,
+                agentic_time,
+            ) = run_agentic(solver, verifier, question)
+
+            agentic_extracted = extract_final_number(agentic_answer)
+            agentic_norm = normalize_number(agentic_extracted)
+            first_extracted = extract_final_number(first_answer)
+            first_norm = normalize_number(first_extracted)
+
+            agentic_correct = expected_norm is not None and agentic_norm == expected_norm
+            first_correct = expected_norm is not None and first_norm == expected_norm
+
+            print(
+                "[Verification] extracted="
+                f"{agentic_extracted} correct={agentic_correct} attempts={attempts} "
+                f"time={agentic_time:.2f}s"
+            )
+
+            agentic_correct_total += int(agentic_correct)
+            agentic_time_total += agentic_time
+            correction_total += int((not baseline_correct) and agentic_correct)
+
+            if decisions:
+                final_decision = decisions[-1]
+                false_positive_total += int(
+                    final_decision == "ACCEPT" and not agentic_correct
+                )
+                false_negative_total += int(
+                    expected_norm is not None
+                    and first_norm == expected_norm
+                    and decisions[0] == "REVISE"
+                )
+
+        # Majority voting mode
+        majority_answer = ""
+        majority_extracted = None
+        majority_correct = False
+        vote_answers = []
+        vote_numbers = []
+        majority_time = 0.0
+
+        if args.mode in ("majority", "both"):
+            (
+                majority_answer,
+                vote_answers,
+                vote_numbers,
+                majority_time,
+            ) = run_majority_voting(solver, question, num_votes=args.votes)
+
+            majority_extracted = extract_final_number(majority_answer)
+            majority_norm = normalize_number(majority_extracted)
+            majority_correct = expected_norm is not None and majority_norm == expected_norm
+
+            print(
+                f"[Majority@{args.votes}] votes={vote_numbers} "
+                f"extracted={majority_extracted} correct={majority_correct} "
+                f"time={majority_time:.2f}s"
+            )
+
+            majority_correct_total += int(majority_correct)
+            majority_time_total += majority_time
+
+        # Build row (using verification fields, add majority info to decisions field)
+        attempt_extracted = [
+            extract_final_number(answer) for answer in attempt_answers
+        ] if attempt_answers else []
+        attempt_correct = [
+            normalize_number(value) == expected_norm if expected_norm is not None else False
+            for value in attempt_extracted
+        ] if attempt_extracted else []
+
+        correction_step = None
+        if expected_norm is not None and attempt_correct:
+            for idx_attempt, is_correct in enumerate(attempt_correct, start=1):
+                if is_correct:
+                    correction_step = idx_attempt
+                    break
 
         rows.append(
             EvalRow(
                 question=question,
                 expected_answer=expected or "",
                 baseline_answer=baseline_answer,
-                agentic_answer=agentic_answer,
+                agentic_answer=agentic_answer if args.mode != "majority" else majority_answer,
                 baseline_extracted=baseline_extracted,
-                agentic_extracted=agentic_extracted,
+                agentic_extracted=agentic_extracted if args.mode != "majority" else majority_extracted,
                 baseline_correct=baseline_correct,
-                agentic_correct=agentic_correct,
-                initial_correct=first_correct,
-                attempt_extracted=attempt_extracted,
+                agentic_correct=agentic_correct if args.mode != "majority" else majority_correct,
+                initial_correct=first_correct if args.mode in ("verification", "both") else baseline_correct,
+                attempt_extracted=attempt_extracted if args.mode != "majority" else vote_numbers,
                 attempt_correct=attempt_correct,
                 correction_step=correction_step,
-                verifier_decisions=decisions,
-                attempts=attempts,
+                verifier_decisions=decisions if args.mode != "majority" else vote_numbers,
+                attempts=attempts if args.mode != "majority" else args.votes,
                 baseline_time_s=baseline_time,
-                agentic_time_s=agentic_time,
+                agentic_time_s=agentic_time if args.mode != "majority" else majority_time,
             )
         )
 
@@ -347,23 +467,35 @@ def main() -> None:
 
     total = max(len(records), 1)
     baseline_acc = baseline_correct_total / total
-    agentic_acc = agentic_correct_total / total
-    accuracy_improvement = agentic_acc - baseline_acc
-    correction_rate = correction_total / total
-    false_positive_rate = false_positive_total / total
-    false_negative_rate = false_negative_total / total
     baseline_avg_time = baseline_time_total / total
-    agentic_avg_time = agentic_time_total / total
 
     print("\n=== Metrics ===")
     print(f"Baseline accuracy: {baseline_acc:.3f}")
-    print(f"Agentic accuracy: {agentic_acc:.3f}")
-    print(f"Accuracy improvement: {accuracy_improvement:.3f}")
-    print(f"Correction rate: {correction_rate:.3f}")
-    print(f"False positive rate: {false_positive_rate:.3f}")
-    print(f"False negative rate: {false_negative_rate:.3f}")
     print(f"Avg baseline time (s): {baseline_avg_time:.2f}")
-    print(f"Avg agentic time (s): {agentic_avg_time:.2f}")
+
+    if args.mode in ("verification", "both"):
+        agentic_acc = agentic_correct_total / total
+        verification_improvement = agentic_acc - baseline_acc
+        correction_rate = correction_total / total
+        false_positive_rate = false_positive_total / total
+        false_negative_rate = false_negative_total / total
+        agentic_avg_time = agentic_time_total / total
+
+        print(f"\n[Self-Verification]")
+        print(f"  Accuracy: {agentic_acc:.3f} (improvement: {verification_improvement:+.3f})")
+        print(f"  Correction rate: {correction_rate:.3f}")
+        print(f"  False positive rate: {false_positive_rate:.3f}")
+        print(f"  False negative rate: {false_negative_rate:.3f}")
+        print(f"  Avg time (s): {agentic_avg_time:.2f}")
+
+    if args.mode in ("majority", "both"):
+        majority_acc = majority_correct_total / total
+        majority_improvement = majority_acc - baseline_acc
+        majority_avg_time = majority_time_total / total
+
+        print(f"\n[Majority Voting @{args.votes}]")
+        print(f"  Accuracy: {majority_acc:.3f} (improvement: {majority_improvement:+.3f})")
+        print(f"  Avg time (s): {majority_avg_time:.2f}")
     print(f"Results written to: {args.output}")
     if args.summary_csv:
         print(f"Summary CSV written to: {args.summary_csv}")

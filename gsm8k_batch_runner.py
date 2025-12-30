@@ -110,7 +110,7 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("AI525_Project/batch_runs"),
+        default=Path("gsm8k_results/batch_runs"),
         help="Directory to store per-run outputs.",
     )
     args = parser.parse_args()

@@ -26,7 +26,9 @@ from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 
-SOLVER_MODEL = os.getenv("SOLVER_MODEL", "llama3.2:3b")
+# Using the same model for both is valid - different prompts create independent reasoning paths
+# The verifier's structured format and temperature=0 ensure rigorous checking
+SOLVER_MODEL = os.getenv("SOLVER_MODEL", "qwen2.5:7b")
 VERIFIER_MODEL = os.getenv("VERIFIER_MODEL", "qwen2.5:7b")
 
 MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "3"))
@@ -44,39 +46,46 @@ SOLVER_SYSTEM = SystemMessage(
         "- Show clear step-by-step reasoning\n"
         "- End with: Final Answer: <number>\n\n"
         "When receiving verification feedback:\n"
-        "- Read the verifier's solution carefully\n"
-        "- Compare it to your approach\n"
-        "- If the verifier found an error, acknowledge it and fix it\n"
-        "- If you still believe your answer is correct, explain why\n"
-        "- Show all arithmetic clearly"
+        "- The verifier has solved the problem independently\n"
+        "- If the verifier found an error, carefully check their math\n"
+        "- If their correction is valid, adopt their answer\n"
+        "- Show your corrected work step by step\n"
+        "- End with: Final Answer: <number>"
     )
 )
 
 VERIFIER_SYSTEM = SystemMessage(
     content=(
         "You are a mathematical verification specialist. Your job is to catch errors.\n\n"
-        "PROCESS:\n"
-        "1. Solve the problem independently step-by-step\n"
-        "2. Extract the assistant's final numeric answer\n"
-        "3. Compare both solutions carefully\n"
-        "4. Check your arithmetic twice\n\n"
+        "CRITICAL: You will receive:\n"
+        "1. The original problem\n"
+        "2. An assistant's proposed solution\n\n"
+        "YOUR TASK:\n"
+        "1. FIRST: Solve the problem yourself from scratch WITHOUT looking at the assistant's final number\n"
+        "2. Show ALL arithmetic steps clearly\n"
+        "3. THEN: Compare your answer to the assistant's answer\n"
+        "4. If there's a discrepancy, identify exactly where the error occurred\n\n"
         "DECISION RULES:\n"
-        "- If answers match within 1% tolerance → ACCEPT\n"
-        "- If you found a specific calculation error → REVISE\n"
-        "- If methods differ but both seem valid → Show your work, then decide\n\n"
-        "FORMAT:\n"
-        "My Solution: [your step-by-step work]\n"
-        "Assistant's Answer: [extracted number]\n"
-        "My Answer: [your number]\n"
-        "Comparison: [detailed comparison]\n"
-        "DECISION: [ACCEPT or REVISE]"
+        "- ACCEPT: Your answer matches the assistant's (within 1%)\n"
+        "- REVISE: You found a specific calculation error. You MUST explain the exact error and provide the correct answer.\n\n"
+        "FORMAT (follow exactly):\n"
+        "=== MY INDEPENDENT SOLUTION ===\n"
+        "[Your step-by-step work here]\n"
+        "My Answer: [number]\n\n"
+        "=== VERIFICATION ===\n"
+        "Assistant's Answer: [number]\n"
+        "Match: [Yes/No]\n"
+        "Error Found: [None OR specific description of the error]\n\n"
+        "DECISION: [ACCEPT or REVISE]\n"
+        "[If REVISE: Explain the specific error and correct answer]"
     )
 )
 
 
 def build_llms() -> tuple[ChatOllama, ChatOllama]:
     common_kwargs = {"request_timeout": REQUEST_TIMEOUT} if REQUEST_TIMEOUT else {}
-    solver = ChatOllama(model=SOLVER_MODEL, temperature=0.3, **common_kwargs)
+    # Both at temperature=0 for deterministic, reproducible results
+    solver = ChatOllama(model=SOLVER_MODEL, temperature=0.0, **common_kwargs)
     verifier = ChatOllama(model=VERIFIER_MODEL, temperature=0.0, **common_kwargs)
     return solver, verifier
 
@@ -154,13 +163,15 @@ def parse_decision(text: str) -> str:
     return "REVISE"
 
 
-def has_critique_and_suggestions(text: str) -> bool:
+def has_valid_verification_format(text: str) -> bool:
+    """Check if verifier output has the required structured format."""
     if not text:
         return False
     lowered = text.lower()
-    has_critique = "critique" in lowered
-    has_suggestions = "suggest" in lowered
-    return has_critique and has_suggestions
+    # Check for key elements of the new format
+    has_solution = "my answer:" in lowered or "=== my independent solution ===" in lowered
+    has_decision = "decision:" in lowered
+    return has_solution and has_decision
 
 
 def answers_are_equivalent(answer1: str, answer2: str, tolerance: float = ANSWER_TOLERANCE) -> bool:
@@ -178,34 +189,62 @@ def answers_are_equivalent(answer1: str, answer2: str, tolerance: float = ANSWER
     return abs(val1 - val2) / abs(val2) < tolerance
 
 
-def is_valid_critique(critique_text: str, original_answer: str) -> bool:
+def extract_verifier_answer(critique_text: str) -> Optional[float]:
+    """Extract the verifier's own computed answer from their solution."""
+    if not critique_text:
+        return None
+    # Look for "My Answer: X" pattern
+    match = re.search(r"my answer[:\s]*([-+]?\d*\.?\d+)", critique_text, flags=re.IGNORECASE)
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            pass
+    return None
+
+
+def is_valid_critique(critique_text: str) -> bool:
+    """Check if the critique provides a valid, specific error identification."""
     if not critique_text:
         return False
-    if len(critique_text) < 50:
+    if len(critique_text) < 100:  # Increased - need substantive independent solution
         return False
-    reasoning_keywords = [
-        "calculate",
-        "error",
-        "incorrect",
-        "mistake",
-        "should be",
-        "actually",
-    ]
-    has_reasoning = any(kw in critique_text.lower() for kw in reasoning_keywords)
-    has_specifics = bool(re.search(r"\d", critique_text))
-    mentions_answer = answers_are_equivalent(critique_text, original_answer) or bool(
-        re.search(r"final answer", critique_text, flags=re.IGNORECASE)
-    )
-    return has_reasoning and has_specifics and mentions_answer
+
+    lowered = critique_text.lower()
+
+    # Must have shown their own work
+    has_own_solution = "my answer:" in lowered or "=== my independent solution ===" in lowered
+
+    # Must identify a specific error (not just say "revise")
+    error_keywords = ["error", "incorrect", "mistake", "wrong", "should be", "actually"]
+    has_specific_error = any(kw in lowered for kw in error_keywords)
+
+    # Must have numbers (showing actual calculation)
+    has_math = bool(re.search(r"\d+\s*[+\-*/]\s*\d+|\d+\s*=", critique_text))
+
+    # Verifier must have computed their own answer
+    verifier_answer = extract_verifier_answer(critique_text)
+    has_verifier_answer = verifier_answer is not None
+
+    return has_own_solution and has_specific_error and has_verifier_answer and has_math
 
 
 def build_feedback_message(critique_text: str) -> HumanMessage:
+    verifier_answer = extract_verifier_answer(critique_text)
+    answer_hint = ""
+    if verifier_answer is not None:
+        answer_hint = f"\n\nThe verifier computed the answer as: {verifier_answer}"
+
     return HumanMessage(
         content=(
-            "Verifier feedback about your last answer:\n"
-            f"{critique_text}\n"
-            "Revise only to fix arithmetic/units or clear logical errors. "
-            "Keep the answer concise and end with 'Final Answer: <number>'."
+            "A verifier has independently solved this problem and found an error in your solution.\n\n"
+            f"=== VERIFIER FEEDBACK ===\n{critique_text}\n"
+            f"{answer_hint}\n\n"
+            "Please:\n"
+            "1. Carefully review the verifier's solution\n"
+            "2. Identify where your calculation went wrong\n"
+            "3. Redo the calculation step by step\n"
+            "4. End with 'Final Answer: <number>'"
         )
     )
 
@@ -214,33 +253,41 @@ def enforce_verifier_structure(
     verifier: ChatOllama, messages: List, critique: AIMessage
 ) -> AIMessage:
     content = (critique.content or "").strip()
-    if has_critique_and_suggestions(content):
+    if has_valid_verification_format(content):
         return critique
 
     for attempt in range(1, MAX_VERIFIER_RETRIES + 1):
         retry_msgs = messages + [
             HumanMessage(
                 content=(
-                    "Your response must include:\n"
-                    "1) A critique section labeled 'Critique:'\n"
-                    "2) A suggestions section labeled 'Suggestions:' with 1-3 items\n"
-                    "3) A final line 'DECISION: ACCEPT' or 'DECISION: REVISE'\n"
+                    "Your response must follow this exact format:\n"
+                    "=== MY INDEPENDENT SOLUTION ===\n"
+                    "[Your step-by-step work]\n"
+                    "My Answer: [number]\n\n"
+                    "=== VERIFICATION ===\n"
+                    "Assistant's Answer: [number]\n"
+                    "Match: [Yes/No]\n"
+                    "Error Found: [description or None]\n\n"
+                    "DECISION: [ACCEPT or REVISE]\n"
                     "Please respond again with that exact structure."
                 )
             )
         ]
         critique = verifier.invoke(retry_msgs)
         content = (critique.content or "").strip()
-        if has_critique_and_suggestions(content):
+        if has_valid_verification_format(content):
             print(f"[Verifier] Structured output recovered on retry {attempt}.")
             return critique
 
     fallback = (
-        "Critique: Verifier did not provide a critique.\n"
-        "Suggestions: Please provide a critique and 1-3 suggestions.\n"
-        "DECISION: REVISE"
+        "=== MY INDEPENDENT SOLUTION ===\n"
+        "Unable to verify independently.\n"
+        "My Answer: N/A\n\n"
+        "=== VERIFICATION ===\n"
+        "Could not complete verification.\n"
+        "DECISION: ACCEPT"
     )
-    print("[Verifier] Missing critique/suggestions; using fallback critique.")
+    print("[Verifier] Missing required format; using fallback (ACCEPT).")
     return AIMessage(content=fallback)
 
 
