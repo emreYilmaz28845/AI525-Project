@@ -203,29 +203,58 @@ def extract_verifier_answer(critique_text: str) -> Optional[float]:
     return None
 
 
-def is_valid_critique(critique_text: str) -> bool:
-    """Check if the critique provides a valid, specific error identification."""
+def is_valid_critique(critique_text: str, solver_answer: Optional[str] = None) -> bool:
+    """
+    Check if the critique provides a valid, specific error identification.
+
+    CONSERVATIVE APPROACH: Only return True if we're highly confident the verifier
+    found a real error. This reduces false negatives (degrading correct answers).
+    """
     if not critique_text:
         return False
-    if len(critique_text) < 100:  # Increased - need substantive independent solution
+    if len(critique_text) < 150:  # Need substantial independent solution
         return False
 
     lowered = critique_text.lower()
 
-    # Must have shown their own work
-    has_own_solution = "my answer:" in lowered or "=== my independent solution ===" in lowered
+    # Must have shown their own work with clear structure
+    has_own_solution = "=== my independent solution ===" in lowered or (
+        "my answer:" in lowered and "step" in lowered
+    )
 
-    # Must identify a specific error (not just say "revise")
-    error_keywords = ["error", "incorrect", "mistake", "wrong", "should be", "actually"]
-    has_specific_error = any(kw in lowered for kw in error_keywords)
+    # Must identify a SPECIFIC error (not just say "revise" or generic "error")
+    specific_error_patterns = [
+        r"should be \d+",           # "should be 42"
+        r"correct answer is \d+",   # "correct answer is 42"
+        r"got \d+ instead of \d+",  # "got 10 instead of 15"
+        r"calculated \d+ but",      # "calculated 5 but..."
+        r"error:.*\d+",             # "error: used 3 instead of 4"
+    ]
+    has_specific_error = any(re.search(p, lowered) for p in specific_error_patterns)
 
-    # Must have numbers (showing actual calculation)
-    has_math = bool(re.search(r"\d+\s*[+\-*/]\s*\d+|\d+\s*=", critique_text))
+    # Fallback: check for error keywords with numbers nearby
+    if not has_specific_error:
+        error_keywords = ["mistake", "incorrect", "wrong calculation", "arithmetic error"]
+        has_error_keyword = any(kw in lowered for kw in error_keywords)
+        has_nearby_numbers = bool(re.search(r"(mistake|incorrect|wrong|error).{0,30}\d+", lowered))
+        has_specific_error = has_error_keyword and has_nearby_numbers
+
+    # Must have actual arithmetic shown (not just stating numbers)
+    has_math = bool(re.search(r"\d+\s*[+\-*/×÷]\s*\d+\s*=\s*\d+", critique_text))
 
     # Verifier must have computed their own answer
     verifier_answer = extract_verifier_answer(critique_text)
     has_verifier_answer = verifier_answer is not None
 
+    # NEW: If solver answer provided, verify the answers are actually different
+    if solver_answer and has_verifier_answer:
+        solver_num = extract_verifier_answer(f"My Answer: {solver_answer}")
+        if solver_num is not None and verifier_answer is not None:
+            # If answers are very close (within 5%), probably not a real error
+            if solver_num != 0 and abs(verifier_answer - solver_num) / abs(solver_num) < 0.05:
+                return False
+
+    # All conditions must be met
     return has_own_solution and has_specific_error and has_verifier_answer and has_math
 
 

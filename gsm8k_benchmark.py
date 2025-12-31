@@ -208,9 +208,13 @@ def run_agentic(
         critique_text = (critique.content or "").strip()
         decision = parse_decision(critique_text)
         if decision == "REVISE":
+            # Conservative filtering: only revise if we're confident it's a real error
             if answers_are_equivalent(last_answer, critique_text, tolerance=ANSWER_TOLERANCE):
-                decision = "ACCEPT"
-            elif not is_valid_critique(critique_text):
+                decision = "ACCEPT"  # Answers match, no need to revise
+            elif not is_valid_critique(critique_text, last_answer):
+                decision = "ACCEPT"  # Critique not specific enough, don't risk degradation
+            elif attempt > 1:
+                # After first revision attempt, stop - further revisions often degrade
                 decision = "ACCEPT"
         decisions.append(decision)
         history.append(critique)
@@ -234,9 +238,10 @@ def run_majority_voting(
     from langchain_ollama import ChatOllama
     from self_verification_agent_local_llama import SOLVER_MODEL, REQUEST_TIMEOUT
 
-    # Use temperature > 0 for diversity in answers
+    # Use moderate temperature for diversity while maintaining quality
+    # 0.7 was too high and caused random errors; 0.3 provides diversity without chaos
     common_kwargs = {"request_timeout": REQUEST_TIMEOUT} if REQUEST_TIMEOUT else {}
-    diverse_solver = ChatOllama(model=SOLVER_MODEL, temperature=0.7, **common_kwargs)
+    diverse_solver = ChatOllama(model=SOLVER_MODEL, temperature=0.3, **common_kwargs)
 
     start = time.time()
     prompt = format_question(question)

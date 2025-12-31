@@ -2,3 +2,4 @@ AI525-env/
 __pycache__/
 *.pyc
 .vscode/
+__pycache__
